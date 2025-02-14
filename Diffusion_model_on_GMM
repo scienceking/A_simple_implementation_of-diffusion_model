@@ -1,0 +1,155 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# Function to generate samples from a Gaussian Mixture Model
+def generate_gaussian_mixture(n_samples):
+    n_components = 4  # Number of Gaussian components
+    means = np.array([[-2, -2], [-2, 2], [2, -2], [2, 2]])  # Component means
+    cov = np.array([[0.05, 0.0], [0.0, 0.05]])  # Covariance matrix (small variance for compact clusters)
+    samples_per_component = n_samples // n_components
+    samples = []
+    for mean in means:
+        samples.append(np.random.multivariate_normal(mean, cov, samples_per_component))
+    samples = np.concatenate(samples, axis=0)
+    np.random.shuffle(samples)
+    return samples
+
+
+# Custom dataset for the Gaussian Mixture Model class
+class GaussianMixtureDataset(Dataset):
+    def __init__(self, n_samples):
+        self.data = torch.tensor(generate_gaussian_mixture(n_samples), dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+
+# Diffusion parameters
+T = 100  # Number of diffusion steps
+beta_start = 0.001
+beta_end = 0.02
+betas = torch.linspace(beta_start, beta_end, T)  # Linear schedule for noise variance
+alphas = 1 - betas
+alpha_bars = torch.cumprod(alphas, dim=0)  # Cumulative product of alpha values
+
+
+# Define the Diffusion Model
+class DiffusionModel(nn.Module):
+    def __init__(self):
+        super(DiffusionModel, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(3, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 2)
+        )
+
+    def forward(self, x, t):
+        t = t.unsqueeze(1)  # Ensure t is a column vector
+        input = torch.cat([x, t], dim=1)  # Concatenate input data with timestep information
+        return self.net(input)
+
+
+# Train the diffusion model
+def train_diffusion_model():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dataset = GaussianMixtureDataset(n_samples=10000)
+    dataloader = DataLoader(dataset, batch_size=128, shuffle=True)
+    model = DiffusionModel().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    num_epochs = 1000
+
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for x0 in dataloader:
+            x0 = x0.to(device)  # Original data x0, shape (batch, 2)
+            batch_size = x0.shape[0]
+
+            # Randomly sample diffusion step t for each sample
+            t = torch.randint(0, T, (batch_size,), device=device)
+            t_norm = t.float() / T  # Normalize t for model input
+
+            # Compute x_t using the diffusion equation
+            a_bar = alpha_bars[t.cpu()].unsqueeze(1).to(device)  # Fetch alpha_bar values for sampled timesteps
+            noise = torch.randn_like(x0)  # Standard normal noise
+            sqrt_a_bar = torch.sqrt(a_bar)
+            sqrt_one_minus_a_bar = torch.sqrt(1 - a_bar)
+            x_t = sqrt_a_bar * x0 + sqrt_one_minus_a_bar * noise
+
+            # Predict noise using the model
+            noise_pred = model(x_t, t_norm)
+            loss = nn.MSELoss()(noise_pred, noise)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * batch_size
+
+        running_loss /= len(dataset)
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {running_loss:.4f}")
+    return model
+
+
+# Sampling process: reverse diffusion to generate data samples
+@torch.no_grad()
+def sample(model, num_samples):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+
+    # Start with pure Gaussian noise (x_T)
+    x = torch.randn(num_samples, 2).to(device)
+
+    # Reverse iterate from T-1 to 0
+    for t in reversed(range(T)):
+        t_tensor = torch.full((num_samples,), t, device=device, dtype=torch.float32)
+        t_norm = t_tensor / T
+
+        # Predict noise using the trained model
+        noise_pred = model(x, t_norm)
+        beta_t = betas[t].to(device)
+        alpha_t = alphas[t].to(device)
+        a_bar_t = alpha_bars[t].to(device)
+
+        # Compute x_{t-1} using the diffusion equation
+        coef1 = 1 / torch.sqrt(alpha_t)
+        coef2 = beta_t / torch.sqrt(1 - a_bar_t)
+        x = coef1 * (x - coef2 * noise_pred)
+
+        if t > 0:
+            # Add noise for t > 0 to simulate stochastic sampling
+            noise = torch.randn_like(x)
+            sigma_t = torch.sqrt(beta_t)
+            x = x + sigma_t * noise
+
+    return x.cpu().numpy()
+
+
+if __name__ == '__main__':
+    # Train the diffusion model
+    model = train_diffusion_model()
+
+    # Generate samples using the trained model
+    generated_samples = sample(model, num_samples=1000)
+
+    # Visualize generated samples vs. real data distribution
+    plt.figure(figsize=(6, 6))
+    plt.scatter(generated_samples[:, 0], generated_samples[:, 1],
+                s=10, alpha=0.6, label="Generated samples", color="blue")
+    real_data = generate_gaussian_mixture(1000)
+    plt.scatter(real_data[:, 0], real_data[:, 1],
+                s=10, alpha=0.6, label="Real data", color="red")
+    plt.legend()
+    plt.title("Diffusion Model Sampling vs Real Data")
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.show()
